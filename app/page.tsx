@@ -1,10 +1,9 @@
 // Arquivo: /app/page.tsx (ou page.js)
 
-"use client"; // Necessário para usar hooks como o useState
+"use client"; 
 
 import { useState } from 'react';
 
-// Estado para guardar as informações do trabalho e o arquivo
 type JobInfo = {
   jobId: string;
   uploadContainerUrl: string;
@@ -15,17 +14,19 @@ export default function Home() {
   const [job, setJob] = useState<JobInfo | null>(null);
   const [file, setFile] = useState<File | null>(null);
   const [statusMessage, setStatusMessage] = useState("Pronto.");
+  const [uploadDone, setUploadDone] = useState(false);
 
-  // PASSO 1: Chama a API que acabamos de criar
+  // PASSO 1: Chama a API para criar o trabalho
   const handleCreateJob = async () => {
     setStatusMessage("Criando trabalho na Azure...");
+    setJob(null);
+    setFile(null);
+    setUploadDone(false);
+
     try {
       const response = await fetch('/api/jobs/create', { method: 'POST' });
       const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(data.message || "Falha ao criar trabalho");
-      }
+      if (!response.ok) throw new Error(data.message || "Falha ao criar trabalho");
 
       setJob(data);
       setStatusMessage(`Trabalho ${data.jobId} criado! Selecione um arquivo.`);
@@ -40,40 +41,54 @@ export default function Home() {
       setStatusMessage("Selecione um trabalho e um arquivo primeiro.");
       return;
     }
-
     setStatusMessage(`Enviando ${file.name} para o job ${job.jobId}...`);
+    setUploadDone(false);
 
     try {
-      // 1. "Quebra" a URL SAS que recebemos
-      //    BaseURL: https://stbiotrack.blob.core.windows.net/uploads
-      //    sasToken: ?sv=2025-11-05&se=...
       const [baseUrl, sasToken] = job.uploadContainerUrl.split('?');
-
-      // 2. Define o caminho completo do novo arquivo na nuvem
       const blobPath = `${job.jobStoragePath}/${file.name}`;
-      
-      // 3. Monta a URL final para o comando PUT
       const uploadUrl = `${baseUrl}/${blobPath}?${sasToken}`;
       
-      // 4. Envia o arquivo!
       const uploadResponse = await fetch(uploadUrl, {
         method: 'PUT',
-        body: file, // O corpo da requisição é o próprio arquivo
-        headers: {
-          'x-ms-blob-type': 'BlockBlob', // Informa à Azure que é um upload de "bloco"
-          'Content-Type': file.type, // Opcional, mas boa prática
-        },
+        body: file,
+        headers: { 'x-ms-blob-type': 'BlockBlob', 'Content-Type': file.type },
       });
 
-      if (!uploadResponse.ok) {
-        throw new Error("Falha no upload para o Blob Storage.");
-      }
+      if (!uploadResponse.ok) throw new Error("Falha no upload para o Blob Storage.");
 
-      setStatusMessage(`Arquivo ${file.name} enviado com sucesso!`);
-      // O próximo passo (que faremos depois) é enfileirar este job
+      setStatusMessage(`Arquivo ${file.name} enviado! Pronto para iniciar.`);
+      setUploadDone(true); // Habilita o Passo 3
       
     } catch (error: any) {
       setStatusMessage(`Erro no upload: ${error.message}`);
+    }
+  };
+
+  // --- NOVO PASSO 3 ---
+  // Envia o trabalho para a fila
+  const handleStartJob = async () => {
+    if (!job) {
+      setStatusMessage("Nenhum trabalho ativo.");
+      return;
+    }
+    setStatusMessage(`Enviando job ${job.jobId} para a fila de processamento...`);
+
+    try {
+      const response = await fetch('/api/jobs/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jobId: job.jobId }) // Envia o jobId
+      });
+      
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.message || "Falha ao enfileirar trabalho");
+
+      setStatusMessage(data.message);
+      setJob(null); // Reseta a UI para um novo trabalho
+
+    } catch (error: any) {
+      setStatusMessage(`Erro ao iniciar: ${error.message}`);
     }
   };
 
@@ -87,11 +102,27 @@ export default function Home() {
 
       <input 
         type="file" 
-        onChange={(e) => setFile(e.target.files ? e.target.files[0] : null)}
-        disabled={!job} // Habilita somente após criar o trabalho
+        onChange={(e) => {
+          setFile(e.target.files ? e.target.files[0] : null);
+          setUploadDone(false); // Reseta se trocar o arquivo
+        }}
+        disabled={!job}
       />
-      <button onClick={handleUpload} disabled={!file}>2. Fazer Upload do Arquivo</button>
+      <button onClick={handleUpload} disabled={!file || !job}>
+        2. Fazer Upload do Arquivo
+      </button>
       
+      <hr style={{ margin: '20px 0' }} />
+
+      {/* --- NOVO BOTÃO --- */}
+      <button 
+        onClick={handleStartJob} 
+        disabled={!uploadDone || !job} // Habilita só após o upload
+        style={{ fontWeight: 'bold' }}
+      >
+        3. Iniciar Processamento (Colocar na Fila)
+      </button>
+
       <hr style={{ margin: '20px 0' }} />
 
       <h2>Status:</h2>
