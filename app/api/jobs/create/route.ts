@@ -64,7 +64,7 @@ export async function POST(request: Request) {
       message: "Trabalho criado com sucesso!",
       jobId: jobId,
       uploadContainerUrl: sasUrl,
-      jobStoragePath: `uploads/${jobId}`
+      jobStoragePath: jobId
     }, { status: 201 }); // Status 201 = Created
 
   } catch (error) {
