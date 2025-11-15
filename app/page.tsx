@@ -12,10 +12,14 @@ type JobInfo = {
 
 type JobStatus = "PRONTO" | "CRIANDO" | "ENVIANDO" | "PROCESSANDO" | "CONCLUIDO" | "FALHA";
 
+const MAX_CONCURRENT_UPLOADS = 5;
+
 export default function Home() {
   const [job, setJob] = useState<JobInfo | null>(null);
-  const [file, setFile] = useState<File | null>(null);
-  
+  const [files, setFiles] = useState<File[] | null>(null);
+  const [uploadDone, setUploadDone] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState(0);
+
   const [statusMessage, setStatusMessage] = useState("Pronto.");
   const [jobStatus, setJobStatus] = useState<JobStatus>("PRONTO");
   const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
@@ -44,7 +48,8 @@ export default function Home() {
     setStatusMessage("Criando trabalho na Azure...");
     setJobStatus("CRIANDO");
     setJob(null);
-    setFile(null);
+    setFiles(null); 
+    setUploadDone(false)
     setDownloadUrl(null);
     setElapsedTime(null); // Reseta o timer
     clearAllIntervals(); // Para qualquer polling ou timer antigo
@@ -65,32 +70,80 @@ export default function Home() {
 
   // PASSO 2: Faz o upload do arquivo
   const handleUpload = async () => {
-    if (!file || !job) {
-      setStatusMessage("Selecione um trabalho e um arquivo primeiro.");
+    if (!files || files.length === 0 || !job) {
+      setStatusMessage("Selecione um trabalho e ao menos um arquivo primeiro.");
       return;
     }
-    setStatusMessage(`Enviando ${file.name} para o job ${job.jobId}...`);
-    setJobStatus("ENVIANDO");
 
-    try {
-      const [baseUrl, sasToken] = job.uploadContainerUrl.split('?');
-      const blobPath = `${job.jobStoragePath}/${file.name}`;
-      const uploadUrl = `${baseUrl}/${blobPath}?${sasToken}`;
-      
-      const uploadResponse = await fetch(uploadUrl, {
-        method: 'PUT',
-        body: file,
-        headers: { 'x-ms-blob-type': 'BlockBlob', 'Content-Type': file.type },
-      });
+    setStatusMessage(`Iniciando upload de ${files.length} arquivo(s)...`);
+    setUploadDone(false);
+    setUploadProgress(0); // Reseta o progresso
 
-      if (!uploadResponse.ok) throw new Error("Falha no upload para o Blob Storage.");
+    // Criamos uma cópia da fila de arquivos. Usar .shift() é mais performático
+    // do que gerenciar índices em um array gigante.
+    const fileQueue = [...files];
+    const totalFiles = fileQueue.length;
+    const failedUploads: string[] = [];
+    
+    const [baseUrl, sasToken] = job.uploadContainerUrl.split('?');
 
-      setStatusMessage(`Arquivo ${file.name} enviado! Pronto para iniciar.`);
-      setJobStatus("PRONTO");
-      
-    } catch (error: any) {
-      setStatusMessage(`Erro no upload: ${error.message}`);
-      setJobStatus("FALHA");
+    // --- O "Worker" ---
+    // Esta é a função que cada um dos nossos 5 "trabalhadores" vai executar
+    const uploadWorker = async (workerId: number) => {
+      // O worker continua pegando arquivos da fila até ela acabar
+      while (fileQueue.length > 0) {
+        
+        // .shift() remove o primeiro item do array e o retorna.
+        // Isso é "atômico" (thread-safe no JS), então workers não pegarão o mesmo arquivo.
+        const file = fileQueue.shift(); 
+        
+        if (!file) continue; // A fila acabou enquanto ele tentava pegar
+
+        const blobPath = `${job.jobStoragePath}/${file.name}`;
+        const uploadUrl = `${baseUrl}/${blobPath}?${sasToken}`;
+        
+        try {
+          const uploadResponse = await fetch(uploadUrl, {
+            method: 'PUT',
+            body: file,
+            headers: { 'x-ms-blob-type': 'BlockBlob', 'Content-Type': file.type },
+          });
+
+          if (!uploadResponse.ok) {
+            throw new Error(`Falha no upload de ${file.name}`);
+          }
+          
+          // SUCESSO: Atualiza o progresso
+          // Usamos a forma funcional (p => ...) para garantir que estamos
+          // incrementando o estado mais recente, sem "race conditions" de React.
+          setUploadProgress(p => p + 1);
+
+        } catch (error: any) {
+          console.error(`[Worker ${workerId}] Erro ao enviar ${file.name}:`, error);
+          failedUploads.push(file.name);
+        }
+      }
+    };
+
+    // --- Iniciar o Pool ---
+    setStatusMessage("Upload em progresso...");
+
+    // Criamos um array de promessas "trabalhadoras"
+    const workerPromises = [];
+    for (let i = 0; i < MAX_CONCURRENT_UPLOADS; i++) {
+      workerPromises.push(uploadWorker(i));
+    }
+
+    // Esperamos todos os 5 workers terminarem seus loops (ou seja, a fila acabar)
+    await Promise.all(workerPromises);
+
+    // --- Finalização ---
+    if (failedUploads.length > 0) {
+      setStatusMessage(`Concluído com erros. ${totalFiles - failedUploads.length} de ${totalFiles} arquivos enviados. Falhas: ${failedUploads.join(', ')}`);
+      setUploadDone(false); // Não permite iniciar o job se faltou arquivo
+    } else {
+      setStatusMessage(`Todos os ${totalFiles} arquivos enviados! Pronto para iniciar.`);
+      setUploadDone(true);
     }
   };
   
@@ -106,7 +159,7 @@ export default function Home() {
     setStatusMessage(`Enviando job ${jobId} para a fila...`);
     setJobStatus("PROCESSANDO"); // Mudamos para "PROCESSANDO" imediatamente
     setJob(null);
-    setFile(null);
+    setFiles(null);
 
     try {
       const startResponse = await fetch('/api/jobs/start', {
@@ -187,7 +240,7 @@ export default function Home() {
   };
   
   const isStep1Disabled = jobStatus === "CRIANDO" || jobStatus === "ENVIANDO" || jobStatus === "PROCESSANDO";
-  const isStep2Disabled = !file || !job || jobStatus !== "PRONTO";
+  const isStep2Disabled = !files || !job || jobStatus !== "PRONTO";
   // O uploadDone (Passo 2) deve ser concluído antes de iniciar (Passo 3)
   // Assumimos que o usuário faz o upload e o status volta para "PRONTO"
   const isStep3Disabled = !job || jobStatus !== "PRONTO"; 
@@ -204,10 +257,16 @@ export default function Home() {
 
       <input 
         type="file" 
-        onChange={(e) => setFile(e.target.files ? e.target.files[0] : null)}
+        multiple
+        onChange={(e) => {
+          setFiles(e.target.files ? Array.from(e.target.files) : null);
+          setUploadDone(false);
+        }}
         disabled={!job || isStep1Disabled}
+        accept="image/*"
       />
-      <button onClick={handleUpload} disabled={isStep2Disabled}>
+      <button onClick={handleUpload} disabled={!files || files.length === 0 || !job}
+      >
         2. Fazer Upload do Arquivo
       </button>
       
